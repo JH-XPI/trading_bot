@@ -1,0 +1,6 @@
+.env
+accounts.yaml
+.token_*.json
+logs/
+__pycache__/
+*.pyc

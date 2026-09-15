@@ -1,0 +1,205 @@
+# -*- coding: utf-8 -*-
+"""
+DB증권(DB금융투자) Open API 클라이언트 — 계좌/전략별 설정(accounts.yaml)을 읽어
+토큰 발급, 해외주식 시세조회, 해외주식 주문을 수행한다.
+
+안전장치:
+  - accounts.yaml의 enabled=false 인 계좌는 주문을 절대 실제로 전송하지 않는다
+    (계산 결과만 로그로 남기고 dry-run 표시). enabled=true 로 바꿔야 실주문이 나간다.
+  - mode=demo(모의투자) / production(실전) 은 계좌 설정에서 명시적으로 지정해야 하며
+    기본값은 demo. 반드시 demo에서 충분히 검증 후에만 production으로 바꿀 것.
+  - 계좌 자격증명(API 키/시크릿/계좌번호)은 이 코드나 accounts.yaml에 직접 적지 않고
+    전부 환경변수(.env)에서 읽는다.
+
+참고(DB증권 공식 오픈API SDK 리서치 기준):
+  - 토큰 발급: POST {base_url}/oauth2/token, x-www-form-urlencoded,
+      body: grant_type=client_credentials, appkey=..., appsecretkey=..., scope=oob
+      응답: access_token, token_type, expires_in(초)
+  - 인증 헤더: Authorization: Bearer <token>, Content-Type: application/json
+  - 해외주식 현재가조회: POST {base_url}/api/v1/quote/overseas-stock/inquiry/price
+      body.In: {InputIscd1: 종목코드, InputCondMrktDivCode: FY/FN/FA}
+  - 해외주식 주문: POST {base_url}/api/v1/trading/overseas-stock/order
+      body.In: {AstkIsuNo, AstkBnsTpCode(1매도/2매수), AstkOrdprcPtnCode(1지정가/2시장가/5LOC/6MOC 등),
+                AstkOrdCndiTpCode(1FAS/2IOC/3FOK), AstkOrdQty, AstkOrdPrc(시장가면 0),
+                OrdTrdTpCode(0주문/1정정/2취소), OrgOrdNo(신규주문이면 0)}
+      -- 계좌번호 필드는 공식 예제에 명시적으로 나타나지 않았음(별도 확인 필요).
+         첫 실제 호출 시 에러 메시지로 필수 필드를 다시 확인할 것.
+  - base_url은 실전/모의 동일하며, "앱키 쌍"만 다르다(모의: vtl_*, 운영: prd_* 접두어 관례).
+    본 코드는 accounts.yaml에서 명시적으로 별도 env var(app_key_env/app_secret_env)를
+    지정하도록 해 실전/모의 키를 계좌 설정 단위로 명확히 분리한다.
+"""
+from __future__ import annotations
+import os, json, time, logging
+from dataclasses import dataclass
+from typing import Optional
+import requests
+import yaml
+
+BASE_URL = "https://openapi.dbsec.co.kr:8443"
+TOKEN_PATH = "/oauth2/token"
+QUOTE_PATH = "/api/v1/quote/overseas-stock/inquiry/price"
+ORDER_PATH = "/api/v1/trading/overseas-stock/order"
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+LOG_DIR = os.path.join(HERE, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(os.path.join(LOG_DIR, "trading.log"), encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("dbsec")
+
+
+class DBSecError(RuntimeError):
+    pass
+
+
+@dataclass
+class Account:
+    id: str
+    label: str
+    broker: str
+    strategy: str
+    symbol: str
+    market: str
+    mode: str          # demo | production
+    enabled: bool       # False면 실주문 전송 안 함(dry-run)
+    account_no: str
+    app_key: str
+    app_secret: str
+
+
+def _env(name: str) -> str:
+    v = os.environ.get(name, "")
+    if not v:
+        raise DBSecError(f"환경변수 {name} 가 설정되어 있지 않습니다 (.env 확인).")
+    return v
+
+
+def load_accounts(path: str = None) -> list[Account]:
+    path = path or os.path.join(HERE, "accounts.yaml")
+    if not os.path.exists(path):
+        raise DBSecError(f"{path} 가 없습니다. accounts.example.yaml 을 복사해서 만드세요.")
+    with open(path, encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    out = []
+    for a in cfg.get("accounts", []):
+        out.append(Account(
+            id=a["id"], label=a.get("label", a["id"]), broker=a.get("broker", "dbsec"),
+            strategy=a["strategy"], symbol=a.get("symbol", "SOXL"), market=a.get("market", "FN"),
+            mode=a.get("mode", "demo"), enabled=bool(a.get("enabled", False)),
+            account_no=_env(a["account_no_env"]),
+            app_key=_env(a["app_key_env"]),
+            app_secret=_env(a["app_secret_env"]),
+        ))
+    return out
+
+
+# ── 토큰 캐시 (계좌별로 별도 파일, 24시간 유효) ──
+def _token_cache_path(acc: Account) -> str:
+    return os.path.join(HERE, f".token_{acc.id}_{acc.mode}.json")
+
+
+def get_token(acc: Account, force: bool = False) -> str:
+    cache_path = _token_cache_path(acc)
+    if not force and os.path.exists(cache_path):
+        try:
+            data = json.load(open(cache_path, encoding="utf-8"))
+            if data.get("expires_at", 0) > time.time() + 60:
+                return data["access_token"]
+        except Exception:
+            pass
+
+    resp = requests.post(
+        BASE_URL + TOKEN_PATH,
+        headers={"content-type": "application/x-www-form-urlencoded"},
+        data={
+            "grant_type": "client_credentials",
+            "appkey": acc.app_key,
+            "appsecretkey": acc.app_secret,
+            "scope": "oob",
+        },
+        timeout=10,
+    )
+    if resp.status_code != 200:
+        raise DBSecError(f"[{acc.id}] 토큰 발급 실패: {resp.status_code} {resp.text[:300]}")
+    data = resp.json()
+    access_token = data.get("access_token")
+    if not access_token:
+        raise DBSecError(f"[{acc.id}] 토큰 응답에 access_token 없음: {data}")
+    expires_in = int(data.get("expires_in", 86400))
+    json.dump(
+        {"access_token": access_token, "expires_at": time.time() + expires_in, "mode": acc.mode},
+        open(cache_path, "w", encoding="utf-8"),
+    )
+    log.info(f"[{acc.id}] 토큰 발급 완료 (mode={acc.mode}, {expires_in}초 유효)")
+    return access_token
+
+
+def _headers(acc: Account) -> dict:
+    return {
+        "content-type": "application/json; charset=utf-8",
+        "authorization": f"Bearer {get_token(acc)}",
+    }
+
+
+def get_quote(acc: Account) -> dict:
+    """해외주식 현재가 조회. 반환: DB증권 응답 그대로(dict). 실패 시 DBSecError."""
+    body = {"In": {"InputIscd1": acc.symbol, "InputCondMrktDivCode": acc.market}}
+    resp = requests.post(BASE_URL + QUOTE_PATH, headers=_headers(acc), json=body, timeout=15)
+    if resp.status_code != 200:
+        raise DBSecError(f"[{acc.id}] 시세조회 실패: {resp.status_code} {resp.text[:300]}")
+    data = resp.json()
+    log.info(f"[{acc.id}] {acc.symbol} 시세조회 응답: {json.dumps(data, ensure_ascii=False)[:500]}")
+    return data
+
+
+def place_order(acc: Account, side: str, qty: int, price: float = 0, order_type: str = "market") -> dict:
+    """
+    side: 'buy' | 'sell'
+    price: 지정가일 때 가격, 시장가(market)면 0
+    order_type: 'market'(시장가) | 'limit'(지정가) | 'loc'(장마감지정가) | 'moc'(장마감시장가, 매도전용)
+
+    acc.enabled == False 이면 실제 전송하지 않고 dry-run 결과만 반환한다.
+    """
+    bns = {"buy": "2", "sell": "1"}[side]
+    ptn = {"market": "2", "limit": "1", "loc": "5", "moc": "6"}[order_type]
+    body_in = {
+        "AstkIsuNo": acc.symbol,
+        "AstkBnsTpCode": bns,
+        "AstkOrdprcPtnCode": ptn,
+        "AstkOrdCndiTpCode": "1",  # FAS(일반)
+        "AstkOrdQty": int(qty),
+        "AstkOrdPrc": 0 if order_type == "market" else price,
+        "OrdTrdTpCode": "0",  # 신규주문
+        "OrgOrdNo": 0,
+    }
+
+    if not acc.enabled:
+        log.warning(f"[{acc.id}] DRY-RUN (enabled=false, 실주문 전송 안 함): {side} {qty}주 {acc.symbol} "
+                    f"({order_type}, price={price}) — In={body_in}")
+        return {"dry_run": True, "In": body_in}
+
+    if acc.mode != "demo":
+        log.warning(f"[{acc.id}] !!! 실전투자(production) 주문 전송 !!! {side} {qty}주 {acc.symbol}")
+
+    resp = requests.post(BASE_URL + ORDER_PATH, headers=_headers(acc), json={"In": body_in}, timeout=15)
+    ok = resp.status_code == 200
+    data = _safe_json(resp)
+    log.info(f"[{acc.id}] 주문 전송 ({'성공' if ok else '실패'}): {side} {qty}주 {acc.symbol} "
+             f"status={resp.status_code} resp={json.dumps(data, ensure_ascii=False)[:500]}")
+    if not ok:
+        raise DBSecError(f"[{acc.id}] 주문 실패: {resp.status_code} {resp.text[:300]}")
+    return data
+
+
+def _safe_json(resp) -> dict:
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw_text": resp.text[:500]}

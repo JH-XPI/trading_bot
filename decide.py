@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 load_dotenv(os.path.join(HERE, ".env"))
 
 import db_client as C
+import notify as N
 
 SOXL_BOT_DIR = os.environ.get("SOXL_BOT_DIR") or os.path.expanduser("~/soxl_bot")
 if not os.path.isdir(SOXL_BOT_DIR):
@@ -93,7 +94,7 @@ def build_buy_orders(predict):
 
 
 def build_sell_orders(predict, real_qty_held):
-    """'LOC 매도'/'MOC 청산' 목표 -> 실제 보유수량과 대조 후 주문 인자 리스트.
+    """'LOC 매도'/'MOC 청산' 목표 -> 실제 보유수량과 대조 후 (주문 인자 리스트, 스킵사유 또는 None).
     합계가 실제 보유수량을 넘으면 전부 스킵(안전장치)."""
     sells = []
     for o in predict["orders"]:
@@ -104,15 +105,13 @@ def build_sell_orders(predict, real_qty_held):
 
     total = sum(s["qty"] for s in sells)
     if total == 0:
-        return []
+        return [], None
     if total > real_qty_held:
-        C.log.warning(
-            f"[SAFETY] 매도 전부 스킵: sniper_lab 계산 매도수량 합계({total}주)가 "
-            f"실제 잔고({real_qty_held}주)보다 많습니다. 전략 계산과 실제 계좌 보유수량이 어긋난 "
-            f"것으로 보여, 원인을 확인하기 전까지 이 계좌의 자동매도를 전부 보류합니다."
-        )
-        return []
-    return sells
+        reason = (f"매도 전부 스킵: 계산된 매도수량 합계({total}주)가 실제 주문가능 잔고"
+                  f"({real_qty_held}주)보다 많음 — 전략 계산과 실제 계좌가 어긋난 것으로 보여 보류")
+        C.log.warning(f"[SAFETY] {reason}")
+        return [], reason
+    return sells, None
 
 
 def main():
@@ -122,10 +121,14 @@ def main():
         return
 
     df, tr = build_base()
+    msg_lines = []  # 텔레그램으로 보낼 전체 요약
 
     for acc in accounts:
-        print(f"\n--- [{acc.id}] {acc.label} (mode={acc.mode}, enabled={acc.enabled}, "
-              f"시작 {acc.start_date} ${acc.start_cap:,.0f}) ---")
+        tag = "실전" if acc.mode != "demo" else "모의"
+        live = "실주문" if acc.enabled else "DRY-RUN"
+        header = f"[{acc.label}] ({tag}/{live})"
+        print(f"\n--- {header} 시작 {acc.start_date} ${acc.start_cap:,.0f} ---")
+        acc_lines = [f"<b>{header}</b>"]
 
         predict = orders_for_account(df, tr, acc)
         print(f"  전략 모드: {predict['mode']}, 보유로트: {len(predict['lots'])}개")
@@ -137,17 +140,29 @@ def main():
             print(f"  잔고조회 실패: {e}")
             print("  -> 이 계좌는 이번 사이클 매도를 전부 건너뜁니다(잔고 확인 불가).")
             real_qty = 0
+            acc_lines.append(f"⚠️ 잔고조회 실패({e}) — 매도 전부 건너뜀")
 
         buys = build_buy_orders(predict)
-        sells = build_sell_orders(predict, real_qty)
+        sells, skip_reason = build_sell_orders(predict, real_qty)
+        if skip_reason:
+            acc_lines.append(f"⚠️ {skip_reason}")
 
         if not buys and not sells:
             print("  오늘 조건에 맞는 주문 없음")
-            continue
+            acc_lines.append("오늘 조건에 맞는 주문 없음")
+        else:
+            for o in buys + sells:
+                result = C.place_order(acc, o["side"], o["qty"], price=o["price"], order_type=o["order_type"])
+                print(f"  [{o['side']}/{o['order_type']}] {o['tier']} {o['qty']:,}주 @ {o['price']} -> {result}")
+                side_kr = "매수" if o["side"] == "buy" else "매도"
+                acc_lines.append(f"{side_kr} {o['tier']} {o['qty']:,}주 @ ${o['price']:.2f} ({o['order_type']})")
 
-        for o in buys + sells:
-            result = C.place_order(acc, o["side"], o["qty"], price=o["price"], order_type=o["order_type"])
-            print(f"  [{o['side']}/{o['order_type']}] {o['tier']} {o['qty']:,}주 @ {o['price']} -> {result}")
+        msg_lines.append("\n".join(acc_lines))
+
+    full_msg = "🎯 SOXL Dual Sniper 자동주문 결과\n\n" + "\n\n".join(msg_lines)
+    print("\n[알림] 텔레그램 전송 시도...")
+    ok = N.send_telegram(full_msg)
+    print(f"[알림] {'전송 완료' if ok else '전송 생략/실패 (로그 확인)'}")
 
 
 if __name__ == "__main__":

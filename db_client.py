@@ -145,6 +145,8 @@ def _headers(acc: Account) -> dict:
     return {
         "content-type": "application/json; charset=utf-8",
         "authorization": f"Bearer {get_token(acc)}",
+        "cont_yn": "N",   # 연속조회 여부(공식 예제 기준 필요 헤더) - 첫 조회는 N
+        "cont_key": "",   # 연속조회 키 - 첫 조회는 빈 값
     }
 
 

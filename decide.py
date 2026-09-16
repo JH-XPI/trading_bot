@@ -152,10 +152,22 @@ def main():
             acc_lines.append("오늘 조건에 맞는 주문 없음")
         else:
             for o in buys + sells:
-                result = C.place_order(acc, o["side"], o["qty"], price=o["price"], order_type=o["order_type"])
-                print(f"  [{o['side']}/{o['order_type']}] {o['tier']} {o['qty']:,}주 @ {o['price']} -> {result}")
                 side_kr = "매수" if o["side"] == "buy" else "매도"
-                acc_lines.append(f"{side_kr} {o['tier']} {o['qty']:,}주 @ ${o['price']:.2f} ({o['order_type']})")
+                try:
+                    result = C.place_order(acc, o["side"], o["qty"], price=o["price"], order_type=o["order_type"])
+                except C.DBSecError as e:
+                    print(f"  [{o['side']}/{o['order_type']}] {o['tier']} {o['qty']:,}주 @ {o['price']} -> 전송 실패: {e}")
+                    acc_lines.append(f"❌ {side_kr} {o['tier']} {o['qty']:,}주 @ ${o['price']:.2f} — 전송 실패(HTTP): {e}")
+                    continue
+
+                print(f"  [{o['side']}/{o['order_type']}] {o['tier']} {o['qty']:,}주 @ {o['price']} -> {result}")
+                if result.get("dry_run"):
+                    acc_lines.append(f"🧪 {side_kr} {o['tier']} {o['qty']:,}주 @ ${o['price']:.2f} ({o['order_type']}) — DRY-RUN, 실전송 안 함")
+                elif result.get("ok"):
+                    acc_lines.append(f"✅ {side_kr} {o['tier']} {o['qty']:,}주 @ ${o['price']:.2f} ({o['order_type']}) — 주문 접수 성공")
+                else:
+                    acc_lines.append(f"❌ {side_kr} {o['tier']} {o['qty']:,}주 @ ${o['price']:.2f} ({o['order_type']}) — "
+                                      f"주문 거부됨: {result.get('rsp_msg') or result.get('rsp_cd')}")
 
         msg_lines.append("\n".join(acc_lines))
 

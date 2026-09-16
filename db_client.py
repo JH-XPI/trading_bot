@@ -236,18 +236,27 @@ def place_order(acc: Account, side: str, qty: int, price: float = 0, order_type:
     if not acc.enabled:
         log.warning(f"[{acc.id}] DRY-RUN (enabled=false, 실주문 전송 안 함): {side} {qty}주 {acc.symbol} "
                     f"({order_type}, price={price}) — In={body_in}")
-        return {"dry_run": True, "In": body_in}
+        return {"dry_run": True, "ok": None, "In": body_in}
 
     if acc.mode != "demo":
         log.warning(f"[{acc.id}] !!! 실전투자(production) 주문 전송 !!! {side} {qty}주 {acc.symbol}")
 
     resp = requests.post(BASE_URL + ORDER_PATH, headers=_headers(acc), json={"In": body_in}, timeout=15)
-    ok = resp.status_code == 200
+    http_ok = resp.status_code == 200
     data = _safe_json(resp)
-    log.info(f"[{acc.id}] 주문 전송 ({'성공' if ok else '실패'}): {side} {qty}주 {acc.symbol} "
-             f"status={resp.status_code} resp={json.dumps(data, ensure_ascii=False)[:500]}")
-    if not ok:
-        raise DBSecError(f"[{acc.id}] 주문 실패: {resp.status_code} {resp.text[:300]}")
+    # 주의: DB증권 API는 주문이 거부돼도 HTTP 200을 반환하고, 실패 사유는 응답 본문의
+    # rsp_cd/rsp_msg에만 담는다. HTTP 상태코드만으로 "성공"을 판단하면 안 되고, 반드시
+    # rsp_cd == "00000" 인지까지 확인해야 실제 체결/접수 성공 여부를 알 수 있다.
+    rsp_cd = data.get("rsp_cd") if isinstance(data, dict) else None
+    biz_ok = http_ok and rsp_cd == "00000"
+    data["ok"] = biz_ok
+    status_kr = "성공" if biz_ok else "실패"
+    log.info(f"[{acc.id}] 주문 전송 ({status_kr}): {side} {qty}주 {acc.symbol} "
+             f"status={resp.status_code} rsp_cd={rsp_cd} resp={json.dumps(data, ensure_ascii=False)[:500]}")
+    if not http_ok:
+        raise DBSecError(f"[{acc.id}] 주문 전송 실패(HTTP): {resp.status_code} {resp.text[:300]}")
+    if not biz_ok:
+        log.warning(f"[{acc.id}] 주문 거부됨(브로커 응답): rsp_cd={rsp_cd} {data.get('rsp_msg')}")
     return data
 
 

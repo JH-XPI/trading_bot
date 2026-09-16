@@ -114,6 +114,30 @@ def build_sell_orders(predict, real_qty_held):
     return sells, None
 
 
+DATA_FRESHNESS_MARKER = os.path.join(HERE, "data", ".decide_last_seen")
+
+
+def check_data_freshness(df) -> tuple:
+    """오늘 daily_update.py가 실제로 새 데이터를 반영했는지 확인.
+    df의 최신 날짜를, 이 스크립트가 직전 실행 때 본 최신 날짜와 비교한다 —
+    두 번 연속 같은 날짜면(=최근 실행 이후 새 거래일 데이터가 한 번도 안 늘었으면)
+    daily_update 갱신이 안 된 것으로 보고 오늘은 전체 주문을 건너뛴다.
+    (주말/공휴일로 실제 새 데이터가 없는 날도 이 조건에 걸리지만, 그 경우 어차피
+    새 종가 없이 주문을 내는 게 더 위험하므로 건너뛰는 게 안전한 쪽이다.)
+    반환: (fresh: bool, latest_date_str: str, prev_seen_str: str or None)
+    """
+    latest = str(df["date"].max().date()) if hasattr(df["date"].max(), "date") else str(df["date"].max())
+    os.makedirs(os.path.dirname(DATA_FRESHNESS_MARKER), exist_ok=True)
+    prev = None
+    if os.path.exists(DATA_FRESHNESS_MARKER):
+        with open(DATA_FRESHNESS_MARKER) as f:
+            prev = f.read().strip() or None
+    fresh = (prev is None) or (latest != prev)
+    with open(DATA_FRESHNESS_MARKER, "w") as f:
+        f.write(latest)
+    return fresh, latest, prev
+
+
 def main():
     accounts = C.load_accounts()
     if not accounts:
@@ -121,6 +145,18 @@ def main():
         return
 
     df, tr = build_base()
+
+    fresh, latest_date, prev_date = check_data_freshness(df)
+    if not fresh:
+        reason = (f"데이터 최신일이 지난 실행 때와 동일합니다({latest_date}) — "
+                  f"daily_update.py 갱신이 오늘 반영되지 않은 것으로 보여, 오래된 데이터로 "
+                  f"잘못된 주문이 나가는 걸 막기 위해 오늘은 모든 계좌의 주문을 전부 건너뜁니다.")
+        print(f"[SAFETY] {reason}")
+        C.log.warning(f"[SAFETY] {reason}")
+        N.send_telegram(f"⚠️ SOXL Dual Sniper 자동주문 건너뜀\n\n{reason}\n"
+                        f"(soxl_bot의 daily_update.py 로그를 확인해주세요)")
+        return
+
     msg_lines = []  # 텔레그램으로 보낼 전체 요약
 
     for acc in accounts:

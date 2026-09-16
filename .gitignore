@@ -4,3 +4,5 @@ accounts.yaml
 logs/
 __pycache__/
 *.pyc
+data/
+decide.log

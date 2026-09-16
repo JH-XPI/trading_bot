@@ -39,6 +39,7 @@ BASE_URL = "https://openapi.dbsec.co.kr:8443"
 TOKEN_PATH = "/oauth2/token"
 QUOTE_PATH = "/api/v1/quote/overseas-stock/inquiry/price"
 ORDER_PATH = "/api/v1/trading/overseas-stock/order"
+BALANCE_PATH = "/api/v1/trading/overseas-stock/inquiry/balance-margin"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
@@ -67,6 +68,8 @@ class Account:
     strategy: str
     symbol: str
     market: str
+    start_date: str     # 이 계좌로 전략을 실제 시작한 날짜 'YYYY-MM-DD' (sniper_lab project_from 기준일)
+    start_cap: float    # 그 시점 투입 원금(USD) — 계좌마다 다를 수 있음
     mode: str          # demo | production
     enabled: bool       # False면 실주문 전송 안 함(dry-run)
     account_no: str
@@ -89,9 +92,15 @@ def load_accounts(path: str = None) -> list[Account]:
         cfg = yaml.safe_load(f) or {}
     out = []
     for a in cfg.get("accounts", []):
+        if "start_date" not in a or "start_cap" not in a:
+            raise DBSecError(
+                f"계좌 '{a.get('id')}' 에 start_date/start_cap 이 없습니다 — 이 계좌를 실제로 시작한 "
+                f"날짜와 투입 원금을 accounts.yaml에 명시하세요 (계좌마다 다를 수 있어 기본값을 두지 않음)."
+            )
         out.append(Account(
             id=a["id"], label=a.get("label", a["id"]), broker=a.get("broker", "dbsec"),
             strategy=a["strategy"], symbol=a.get("symbol", "SOXL"), market=a.get("market", "FN"),
+            start_date=str(a["start_date"]), start_cap=float(a["start_cap"]),
             mode=a.get("mode", "demo"), enabled=bool(a.get("enabled", False)),
             account_no=_env(a["account_no_env"]),
             app_key=_env(a["app_key_env"]),
@@ -159,6 +168,38 @@ def get_quote(acc: Account) -> dict:
     data = resp.json()
     log.info(f"[{acc.id}] {acc.symbol} 시세조회 응답: {json.dumps(data, ensure_ascii=False)[:500]}")
     return data
+
+
+def get_balance(acc: Account) -> dict:
+    """해외주식 잔고/증거금 조회(TR: CAZCQ00400). 반환: DB증권 응답 그대로(dict, Out/Out2/Out3 포함).
+    계좌번호는 별도 필드로 안 넘긴다 — 토큰(appkey)에 이미 계좌가 귀속되어 있음(공식 예제 기준)."""
+    body = {"In": {
+        "WonFcurrTpCode": "2",   # 1:원화잔고 2:외화잔고 — 외화 기준으로 조회
+        "TrxTpCode": "2",        # 1:외화잔고 2:주식잔고상세 3:주식잔고(국가별) 9:당일실현손익
+        "CmsnTpCode": "2",       # 0:제비용 미포함 1:매수제비용만 2:매수+매도 제비용 포함
+        "DpntBalTpCode": "1",    # 0:전체 1:일반 2:소수점 — 일반(정수주) 잔고만
+    }}
+    resp = requests.post(BASE_URL + BALANCE_PATH, headers=_headers(acc), json=body, timeout=15)
+    if resp.status_code != 200:
+        raise DBSecError(f"[{acc.id}] 잔고조회 실패: {resp.status_code} {resp.text[:300]}")
+    data = resp.json()
+    log.info(f"[{acc.id}] 잔고조회 응답: {json.dumps(data, ensure_ascii=False)[:800]}")
+    return data
+
+
+def get_holding_qty(acc: Account) -> int:
+    """get_balance() 응답(Out2: 종목별 보유내역)에서 acc.symbol 의 주문가능수량만 뽑아 합산."""
+    data = get_balance(acc)
+    rows = data.get("Out2") or []
+    qty = 0
+    for r in rows:
+        sym = str(r.get("SymCode") or r.get("AstkIsuNo") or "").strip().upper()
+        if sym == acc.symbol.upper():
+            try:
+                qty += int(float(r.get("AstkOrdAbleQty") or 0))
+            except (TypeError, ValueError):
+                pass
+    return qty
 
 
 def place_order(acc: Account, side: str, qty: int, price: float = 0, order_type: str = "market") -> dict:

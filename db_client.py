@@ -188,15 +188,25 @@ def get_balance(acc: Account) -> dict:
 
 
 def get_holding_qty(acc: Account) -> int:
-    """get_balance() 응답(Out2: 종목별 보유내역)에서 acc.symbol 의 주문가능수량만 뽑아 합산."""
+    """get_balance() 응답(Out2: 종목별 보유내역)에서 acc.symbol 의 "지금 추가로 매도 주문 넣어도
+    되는 수량"을 합산. AstkOrdAbleQty(주문가능수량)를 쓴다 — 이미 다른(수동 포함) 주문에 묶여있는
+    수량은 제외되므로, 이걸 기준으로 해야 자동매매가 이미 나가있는 주문과 중복으로 매도 주문을
+    또 넣는 걸 막을 수 있다. (총 보유수량은 AstkExecBaseQty이지만, 안전장치 목적엔 부적합 —
+    이미 매도 주문이 걸려있는 물량까지 "또 팔아도 되는 것"으로 착각하게 됨)"""
     data = get_balance(acc)
     rows = data.get("Out2") or []
     qty = 0
     for r in rows:
         sym = str(r.get("SymCode") or r.get("AstkIsuNo") or "").strip().upper()
-        if sym == acc.symbol.upper():
+        if sym == acc.symbol.upper() or sym == f"{acc.symbol.upper()}.US":
             try:
-                qty += int(float(r.get("AstkOrdAbleQty") or 0))
+                able_qty = float(r.get("AstkOrdAbleQty") or 0)
+                exec_qty = float(r.get("AstkExecBaseQty") or 0)
+                if exec_qty != able_qty:
+                    log.info(f"[{acc.id}] {acc.symbol} 참고: 총 보유={exec_qty:.0f}주, "
+                             f"주문가능(=매도가능)={able_qty:.0f}주 — 차이는 이미 걸려있는 주문 등으로 "
+                             f"묶여있는 물량. 안전장치는 주문가능 기준으로 판단.")
+                qty += int(able_qty)
             except (TypeError, ValueError):
                 pass
     return qty

@@ -40,6 +40,7 @@ TOKEN_PATH = "/oauth2/token"
 QUOTE_PATH = "/api/v1/quote/overseas-stock/inquiry/price"
 ORDER_PATH = "/api/v1/trading/overseas-stock/order"
 BALANCE_PATH = "/api/v1/trading/overseas-stock/inquiry/balance-margin"
+CHART_DAY_PATH = "/api/v1/quote/overseas-stock/chart/day"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 LOG_DIR = os.path.join(HERE, "logs")
@@ -168,6 +169,43 @@ def get_quote(acc: Account) -> dict:
     data = resp.json()
     log.info(f"[{acc.id}] {acc.symbol} 시세조회 응답: {json.dumps(data, ensure_ascii=False)[:500]}")
     return data
+
+
+def get_daily_chart(acc: Account, date1: str, date2: str) -> list:
+    """해외주식 일차트조회(TR: FSTKCHARTDAY) — date1~date2(YYYYMMDD) 구간의 "확정된" 일별
+    시세(날짜별 시가/고가/저가/종가/거래량)를 반환한다. 현재가조회(get_quote)와 달리 이건
+    "그 날짜가 실제로 마감됐을 때의 값"을 담고 있어서, 장중이든 새벽이든 언제 호출해도
+    과거 날짜의 값은 항상 확정 종가다 — 그래서 daily_update.py가 "지금이 안전한 시간대인지"
+    따질 필요 없이 이 API 하나로 정확한 데이터를 받을 수 있다.
+    반환: [{Date:'YYYYMMDD', Prpr(종가), Oprc, Hprc, Lprc, AcmlVol}, ...] (날짜 오름차순은 보장 안 됨)
+    """
+    out_rows = []
+    cont_yn, cont_key = "N", ""
+    for _ in range(10):  # 페이지 안전 상한
+        headers = _headers(acc)
+        headers["cont_yn"] = cont_yn
+        headers["cont_key"] = cont_key
+        body = {"In": {
+            "InputOrgAdjPrc": "1",
+            "InputCondMrktDivCode": acc.market,
+            "InputIscd1": acc.symbol,
+            "InputDate1": date1,
+            "InputDate2": date2,
+        }}
+        resp = requests.post(BASE_URL + CHART_DAY_PATH, headers=headers, json=body, timeout=15)
+        if resp.status_code != 200:
+            raise DBSecError(f"[{acc.id}] 일별시세 조회 실패: {resp.status_code} {resp.text[:300]}")
+        data = resp.json()
+        if data.get("rsp_cd") != "00000":
+            raise DBSecError(f"[{acc.id}] 일별시세 조회 실패(업무): {data}")
+        rows = data.get("Out") or []
+        out_rows.extend(rows)
+        cont_yn = resp.headers.get("cont_yn") or resp.headers.get("Cont_yn") or "N"
+        cont_key = resp.headers.get("cont_key") or resp.headers.get("Cont_key") or ""
+        if cont_yn != "Y" or not cont_key:
+            break
+    log.info(f"[{acc.id}] {acc.symbol} 일별시세 조회 {date1}~{date2}: {len(out_rows)}건")
+    return out_rows
 
 
 def get_balance(acc: Account) -> dict:

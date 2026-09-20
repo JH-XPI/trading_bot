@@ -10,16 +10,17 @@ report.py와 달리 이건 "지금 이 순간의 잔고"가 아니라 "그 주 �
     누적 매매손익(USD)  - 해외주식 실현손익 조회에서 그 날짜까지의 체결분 합산
     누적 배당순액(USD)  - 계좌거래내역에서 그 날짜까지의 배당입금-배당세 누적
 
-API는 계좌당 딱 2번(거래내역 전체, 실현손익 전체)만 호출하고, 그 결과를 로컬에서
-주차별로 잘라가며 계산한다 — 주마다 API를 다시 부르지 않는다.
+주차별 환율은 "해외주식 거래내역 조회"(CAZCQ01600)의 AstkAppXchrat(적용환율) 필드를
+그대로 쓴다 — 외부 환율 API 없이, 이미 하는 매매 자체에 찍히는 그날의 실제 환율이다.
+
+API는 계좌당 3번(거래내역 전체, 실현손익 전체, 환율용 해외주식거래내역 전체)만 호출하고,
+그 결과를 로컬에서 주차별로 잘라가며 계산한다 — 주마다 API를 다시 부르지 않는다.
 
 사용법:
-    python3 weekly_backfill.py --fx 1383.8
-    (환율은 "현재 시점 원화환산"에만 쓰이고, 과거 주차는 USD 그대로 표시한다 —
-     그때그때 환율을 다 조사하는 건 지난번 합의대로 하지 않는다)
+    python3 weekly_backfill.py
 """
 from __future__ import annotations
-import os, sys, json, argparse
+import os, sys, json, time
 from datetime import date, timedelta, datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -32,6 +33,43 @@ import db_client as C
 import report as R   # fetch_trade_history, RP_*_NAME, INITIAL_START_DATE 등 재사용
 
 OUT_PATH = os.path.join(R.DATA_DIR, "weekly_backfill.json")
+OV_HISTORY_PATH = "/api/v1/trading/overseas-stock/inquiry/trade-history"  # CAZCQ01600
+
+
+def fetch_daily_fx_rates(acc, qry_srt: str, qry_end: str) -> dict:
+    """해외주식 거래내역 조회(CAZCQ01600) - 이 API의 모든 행에는 그날 실제 적용된
+    환율(AstkAppXchrat)이 찍혀 나온다. 반환: {YYYYMMDD: 환율} (거래가 있었던 날짜만)."""
+    rates = {}
+    cont_yn, cont_key = "N", ""
+    for _ in range(60):
+        time.sleep(R.REQUEST_DELAY)
+        headers = C._headers(acc)
+        headers["cont_yn"] = cont_yn
+        headers["cont_key"] = cont_key
+        body = {"In": {"QryTpCode": "0", "StnlnTpCode": "1", "AstkIsuNo": "",
+                       "QrySrtDt": qry_srt, "QryEndDt": qry_end, "DpntBalTpCode": "0"}}
+        resp = requests.post(C.BASE_URL + OV_HISTORY_PATH, headers=headers, json=body, timeout=15)
+        if resp.status_code != 200:
+            raise C.DBSecError(f"[{acc.id}] 해외주식거래내역(환율용) 조회 실패: {resp.status_code} {resp.text[:300]}")
+        data = resp.json()
+        for row in (data.get("Out") or []):
+            d = row.get("TrdDt")
+            rate = row.get("AstkAppXchrat")
+            if d and rate and float(rate) > 0:
+                rates[d] = float(rate)
+        cont_yn = resp.headers.get("cont_yn") or resp.headers.get("Cont_yn") or "N"
+        cont_key = resp.headers.get("cont_key") or resp.headers.get("Cont_key") or ""
+        if cont_yn != "Y" or not cont_key:
+            break
+    return rates
+
+
+def rate_as_of(rate_table: dict, up_to: str):
+    """rate_table(YYYYMMDD->환율)에서 up_to 이전(포함) 중 가장 최근 날짜의 환율(실측값)."""
+    candidates = [d for d in rate_table if d <= up_to]
+    if not candidates:
+        return None
+    return rate_table[max(candidates)]
 
 
 def fetch_realized_pnl_rows(acc, qry_srt: str, qry_end: str) -> list:
@@ -44,7 +82,7 @@ def fetch_realized_pnl_rows(acc, qry_srt: str, qry_end: str) -> list:
     }
     cont_yn, cont_key = "N", ""
     for _ in range(60):
-        import time; time.sleep(R.REQUEST_DELAY)
+        time.sleep(R.REQUEST_DELAY)
         headers = C._headers(acc)
         headers["cont_yn"] = cont_yn
         headers["cont_key"] = cont_key
@@ -60,11 +98,10 @@ def fetch_realized_pnl_rows(acc, qry_srt: str, qry_end: str) -> list:
     return all_rows
 
 
-def week_end_dates(start: date, end: date) -> list[str]:
-    """start~end 사이, 매주 일요일(주말 결산 기준일)을 YYYYMMDD로 나열. 마지막엔 end 자체도 포함."""
+def week_end_dates(start: date, end: date) -> list:
+    """start~end 사이, 매주 일요일을 YYYYMMDD로 나열. 마지막엔 end 자체도 포함."""
     dates = []
     d = start
-    # 그 주의 일요일까지 이동
     d += timedelta(days=(6 - d.weekday() + 1) % 7 or 7) if d.weekday() != 6 else timedelta(0)
     while d <= end:
         dates.append(d.strftime("%Y%m%d"))
@@ -75,7 +112,6 @@ def week_end_dates(start: date, end: date) -> list[str]:
 
 
 def cumulative_at(rows: list, date_field: str, up_to: str) -> dict:
-    """rows 중 date_field <= up_to 인 것만으로 RP/배당 누적값 계산(report.compute_deltas_from_rows 재사용)."""
     subset = [r for r in rows if (r.get(date_field) or "") <= up_to]
     d = R.compute_deltas_from_rows(subset)
     return dict(rp_balance_usd=d["rp_delta"], dividend_net_usd=d["div_net_usd"])
@@ -86,30 +122,27 @@ def cumulative_pnl_at(pnl_rows: list, up_to: str) -> float:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="5/4~오늘 주차별 성장 추이 백필")
-    parser.add_argument("--fx", type=float, required=True, help="오늘 원/달러 환율 (현재시점 원화환산용)")
-    args = parser.parse_args()
-
     accounts = {a.id: a for a in C.load_accounts() if a.id in R.REPORT_ACCOUNTS}
     today = date.today()
     start = datetime.strptime(R.INITIAL_START_DATE, "%Y%m%d").date()
     weeks = week_end_dates(start, today)
     today_str = today.strftime("%Y%m%d")
 
-    # 계좌별로 전체이력 딱 1번씩만 조회
-    acct_rows, acct_pnl_rows = {}, {}
+    acct_rows, acct_pnl_rows, acct_fx = {}, {}, {}
     for aid, acc in accounts.items():
         print(f"[{aid}] 전체이력 조회 중...")
         acct_rows[aid] = R.fetch_trade_history(acc, R.INITIAL_START_DATE, today_str)
         acct_pnl_rows[aid] = fetch_realized_pnl_rows(acc, R.INITIAL_START_DATE, today_str)
+        acct_fx[aid] = fetch_daily_fx_rates(acc, R.INITIAL_START_DATE, today_str)
 
-    # 오늘 시점 실제 잔고(현금+주식)는 report.py 방식 그대로 한 번만 추가로 붙임(참고용)
+    # 계좌마다 환율이 살짝 다를 수 있으니(같은 날이라도), 4계좌 중 그 시점 가장 최근값들의 평균을 씀
+    def week_fx(up_to):
+        vals = [v for aid in accounts if (v := rate_as_of(acct_fx[aid], up_to)) is not None]
+        return sum(vals) / len(vals) if vals else None
+
     today_extra = {}
     for aid, acc in accounts.items():
-        today_extra[aid] = dict(
-            cash_usd=R.get_usd_cash(acc),
-            stock_eval_usd=R.get_stock_eval_usd(acc),
-        )
+        today_extra[aid] = dict(cash_usd=R.get_usd_cash(acc), stock_eval_usd=R.get_stock_eval_usd(acc))
 
     weekly_records = []
     for w in weeks:
@@ -121,45 +154,44 @@ def main():
             total_rp += c["rp_balance_usd"]
             total_pnl += p
             total_div += c["dividend_net_usd"]
-        core_assets_usd = total_rp  # RP만 "잔고성" 자산, 손익은 아래 별도 표기
+        fx = week_fx(w)
+        gain_usd = total_pnl + total_div
         weekly_records.append(dict(
-            week_end=w_disp,
-            rp_balance_usd=total_rp,
-            cum_trading_pnl_usd=total_pnl,
-            cum_dividend_usd=total_div,
-            cum_gain_usd=total_pnl + total_div,   # "확정된 손익" 성장선(RP원금 재투자분 제외한 순수 손익)
+            week_end=w_disp, fx_rate=fx,
+            rp_balance_usd=total_rp, cum_trading_pnl_usd=total_pnl, cum_dividend_usd=total_div,
+            cum_gain_usd=gain_usd, cum_gain_krw=(gain_usd * fx) if fx else None,
         ))
 
-    # 오늘 시점엔 현금+주식평가까지 더해 참고용 총자산도 같이 표기
     today_cash = sum(v["cash_usd"] for v in today_extra.values())
     today_stock = sum(v["stock_eval_usd"] for v in today_extra.values())
+    today_fx = weekly_records[-1]["fx_rate"]
     today_total_usd = weekly_records[-1]["rp_balance_usd"] + today_cash + today_stock
 
     result = dict(
         generated_at=today.strftime("%Y-%m-%d"),
-        fx_rate_today=args.fx,
         weekly=weekly_records,
         today_snapshot=dict(
             cash_usd=today_cash, stock_eval_usd=today_stock,
             rp_balance_usd=weekly_records[-1]["rp_balance_usd"],
-            total_usd=today_total_usd,
-            total_krw=today_total_usd * args.fx,
+            fx_rate=today_fx, total_usd=today_total_usd,
+            total_krw=(today_total_usd * today_fx) if today_fx else None,
         ),
     )
     with open(OUT_PATH, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    print(f"\n{'주(일요일 기준)':>14} {'RP잔고(USD)':>14} {'누적매매손익':>14} {'누적배당':>10} {'누적확정손익':>14} {'주간증감':>12}")
-    prev_gain = 0.0
+    print(f"\n{'주(일요일)':>12} {'적용환율':>9} {'RP잔고(USD)':>13} {'누적손익(USD)':>13} {'누적손익(원화)':>15} {'주간증감(원화)':>15}")
+    prev_krw = 0.0
     for r in weekly_records:
-        gain = r["cum_gain_usd"]
-        delta = gain - prev_gain
-        print(f"{r['week_end']:>14} {r['rp_balance_usd']:14,.2f} {r['cum_trading_pnl_usd']:14,.2f} "
-              f"{r['cum_dividend_usd']:10,.2f} {gain:14,.2f} {delta:+12,.2f}")
-        prev_gain = gain
+        krw = r["cum_gain_krw"] or 0.0
+        delta = krw - prev_krw
+        fx_disp = f"{r['fx_rate']:.1f}" if r["fx_rate"] else "-"
+        print(f"{r['week_end']:>12} {fx_disp:>9} {r['rp_balance_usd']:13,.2f} "
+              f"{r['cum_trading_pnl_usd']+r['cum_dividend_usd']:13,.2f} {krw:15,.0f} {delta:+15,.0f}")
+        prev_krw = krw
 
-    print(f"\n오늘 시점 참고 총자산: ${result['today_snapshot']['total_usd']:,.2f} "
-          f"= {result['today_snapshot']['total_krw']:,.0f}원")
+    print(f"\n오늘 총자산: ${result['today_snapshot']['total_usd']:,.2f} "
+          f"= {result['today_snapshot']['total_krw']:,.0f}원 (환율 {today_fx})")
     print(f"저장됨: {OUT_PATH}")
 
 

@@ -19,16 +19,19 @@ echo "=== $(date '+%F %T') 시작 (pipeline)" >> "$LOG"
 if ! python3 pipeline.py > "$OUT" 2>&1; then
   echo "pipeline 실패 - 기존 페이지 유지" >> "$LOG"
   tail -15 "$OUT" >> "$LOG"
+  python3 notify_report.py fail "pipeline" >> "$LOG" 2>&1
   exit 1
 fi
 grep -E "history|검증|RP 세후|수수료|완료|경고" "$OUT" >> "$LOG"
 
 if ! python3 make_dashboard.py --out report_data/dashboard_new.html >> "$LOG" 2>&1; then
   echo "대시보드 생성 실패 - 기존 페이지 유지" >> "$LOG"
+  python3 notify_report.py fail "대시보드 생성" >> "$LOG" 2>&1
   exit 1
 fi
 
 mkdir -p "$WEBROOT/report"
 cp report_data/dashboard_new.html "$WEBROOT/report/index.html.tmp" \
   && mv "$WEBROOT/report/index.html.tmp" "$WEBROOT/report/index.html" \
-  && echo "배포 완료" >> "$LOG"
+  && echo "배포 완료" >> "$LOG" \
+  && python3 notify_report.py ok >> "$LOG" 2>&1
